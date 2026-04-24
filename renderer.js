@@ -4040,6 +4040,56 @@ document.addEventListener('click', (e) => {
 // ==================== 批量获取所有Token ====================
 
 /**
+ * 批量检测所有账号订阅状态
+ */
+async function batchCheckPlans() {
+  const btn = document.getElementById('batchCheckPlansBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<i data-lucide="loader-2" style="width: 14px; height: 14px; animation: spin 1s linear infinite;"></i> 检测中...';
+    if (typeof lucide !== 'undefined') lucide.createIcons();
+  }
+  
+  try {
+    if (typeof showToast === 'function') showToast('正在批量检测账号订阅状态...', 'info');
+    
+    const result = await window.ipcRenderer.invoke('batch-check-plans');
+    
+    if (result.success) {
+      const s = result.summary;
+      const msg = `检测完成: Trial ${s.trial}, Pro ${s.pro}, Free ${s.free}, 失败 ${s.failed}`;
+      if (typeof showToast === 'function') showToast(msg, 'success');
+      if (typeof showCenterMessage === 'function') showCenterMessage(msg, 'success');
+      
+      // 刷新账号列表
+      if (typeof AccountManager !== 'undefined' && AccountManager.loadAccounts) {
+        await AccountManager.loadAccounts();
+      }
+    } else {
+      if (typeof showToast === 'function') showToast('检测失败: ' + (result.error || '未知错误'), 'error');
+    }
+  } catch (error) {
+    console.error('批量检测失败:', error);
+    if (typeof showToast === 'function') showToast('检测失败: ' + error.message, 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '<i data-lucide="scan" style="width: 14px; height: 14px;"></i> 检测';
+      if (typeof lucide !== 'undefined') lucide.createIcons();
+    }
+  }
+}
+
+// 监听批量检测进度
+window.ipcRenderer.on('batch-check-progress', (event, progress) => {
+  const btn = document.getElementById('batchCheckPlansBtn');
+  if (btn) {
+    btn.innerHTML = `<i data-lucide="loader-2" style="width: 14px; height: 14px; animation: spin 1s linear infinite;"></i> ${progress.current}/${progress.total}`;
+    if (typeof lucide !== 'undefined') lucide.createIcons();
+  }
+});
+
+/**
  * 批量获取所有账号Token
  */
 async function batchGetAllTokens() {

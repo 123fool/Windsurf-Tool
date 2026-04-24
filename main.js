@@ -1323,6 +1323,143 @@ ipcMain.handle('open-external-url', async (event, url) => {
   }
 });
 
+// 内部函数：获取单个账号的 plan 状态
+async function checkSingleAccountPlan(account, accounts) {
+  const axios = require('axios');
+  const CONSTANTS = require('./js/constants');
+  
+  let token = account.idToken || account.apiKey;
+  
+  // 1. 尝试用 refreshToken 刷新
+  if (account.refreshToken) {
+    try {
+      const refreshResp = await axios.post(
+        'https://securetoken.googleapis.com/v1/token?key=AIzaSyDAEIGELke3xco6FNnKrzVOGBnXhSmiJws',
+        `grant_type=refresh_token&refresh_token=${account.refreshToken}`,
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
+      );
+      token = refreshResp.data.id_token || refreshResp.data.access_token;
+      if (refreshResp.data.refresh_token) account.refreshToken = refreshResp.data.refresh_token;
+    } catch (e) {}
+  }
+  
+  // 2. 没有 token → 用邮箱密码登录获取
+  if (!token && account.email && account.password) {
+    try {
+      const loginResp = await axios.post(
+        `${CONSTANTS.WORKER_URL}/login`,
+        { email: account.email, password: account.password, api_key: CONSTANTS.FIREBASE_API_KEY },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 15000 }
+      );
+      token = loginResp.data.idToken;
+      if (loginResp.data.refreshToken) account.refreshToken = loginResp.data.refreshToken;
+      if (loginResp.data.idToken) {
+        account.idToken = loginResp.data.idToken;
+        account.idTokenExpiresAt = Date.now() + (parseInt(loginResp.data.expiresIn || 3600) * 1000);
+      }
+    } catch (e) {
+      return { success: false, error: `登录失败: ${e.message}` };
+    }
+  }
+  
+  if (!token) return { success: false, error: '无法获取 Token' };
+  
+  // 3. 查询 plan
+  try {
+    const resp = await axios.post(
+      'https://web-backend.windsurf.com/exa.seat_management_pb.SeatManagementService/GetPlanStatus',
+      { auth_token: token },
+      {
+        headers: { 'Content-Type': 'application/json', 'X-Auth-Token': token, 'User-Agent': 'Mozilla/5.0' },
+        timeout: 10000
+      }
+    );
+    const planStatus = resp.data.planStatus || resp.data;
+    const planName = planStatus.planInfo?.planName || 'Free';
+    const expiresAt = planStatus.planEnd || planStatus.expiresAt || null;
+    
+    // 更新本地数据
+    account.type = planName;
+    if (expiresAt) account.expiresAt = expiresAt;
+    
+    return { success: true, planName, expiresAt };
+  } catch (e) {
+    return { success: false, error: `查询失败: ${e.message}` };
+  }
+}
+
+// 检测单个账号订阅状态
+ipcMain.handle('check-account-plan', async (event, request = {}) => {
+  try {
+    const accountId = request.accountId;
+    const accountsData = await fs.readFile(ACCOUNTS_FILE, 'utf-8');
+    const accounts = JSON.parse(accountsData);
+    const account = accounts.find(a => a.id === accountId);
+    if (!account) return { success: false, error: '未找到账号' };
+    
+    // 如果不强制刷新且本地已有 type 信息且不是 Free/空/-, 直接返回
+    if (!request.force) {
+      const localType = (account.type || '').toLowerCase();
+      if (localType && localType !== 'free' && localType !== '-' && localType !== '') {
+        return { success: true, planName: account.type, expiresAt: account.expiresAt || null };
+      }
+    }
+    
+    const result = await checkSingleAccountPlan(account, accounts);
+    
+    // 保存更新
+    await fs.writeFile(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), 'utf-8');
+    console.log(`[检测] ${account.email} → ${result.planName || '失败'}`);
+    return result;
+  } catch (error) {
+    console.error('[检测] 失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+// 批量检测所有账号订阅状态
+ipcMain.handle('batch-check-plans', async (event) => {
+  try {
+    const accountsData = await fs.readFile(ACCOUNTS_FILE, 'utf-8');
+    const accounts = JSON.parse(accountsData);
+    const results = [];
+    
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i];
+      if (!acc || !acc.email) continue;
+      
+      // 发送进度
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('batch-check-progress', { current: i + 1, total: accounts.length, email: acc.email });
+      }
+      
+      const result = await checkSingleAccountPlan(acc, accounts);
+      results.push({ email: acc.email, ...result });
+      console.log(`[批量检测] ${i + 1}/${accounts.length} ${acc.email} → ${result.planName || result.error}`);
+      
+      // 延迟避免频率限制
+      if (i < accounts.length - 1) {
+        await new Promise(r => setTimeout(r, 800));
+      }
+    }
+    
+    // 保存所有更新
+    await fs.writeFile(ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), 'utf-8');
+    
+    // 统计
+    const trialCount = results.filter(r => r.planName && r.planName.toLowerCase().includes('trial')).length;
+    const proCount = results.filter(r => r.planName && r.planName.toLowerCase().includes('pro')).length;
+    const freeCount = results.filter(r => r.planName && r.planName.toLowerCase() === 'free').length;
+    const failCount = results.filter(r => !r.success).length;
+    
+    console.log(`[批量检测] 完成: Trial=${trialCount}, Pro=${proCount}, Free=${freeCount}, 失败=${failCount}`);
+    return { success: true, results, summary: { trial: trialCount, pro: proCount, free: freeCount, failed: failCount } };
+  } catch (error) {
+    console.error('[批量检测] 失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
 // 获取绑卡/支付链接
 ipcMain.handle('get-payment-link', async (event, request = {}) => {
   const axios = require('axios');
@@ -1818,7 +1955,7 @@ ipcMain.handle('get-payment-link', async (event, request = {}) => {
       tf: true,
       timeout: 120000,
       userDataDir,
-      args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox', '--no-first-run']
+      args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-setuid-sandbox', '--no-first-run', '--window-size=1280,900', '--window-position=-32000,-32000']
     };
     if (chromePath) connectOptions.executablePath = chromePath;
     
@@ -1826,154 +1963,203 @@ ipcMain.handle('get-payment-link', async (event, request = {}) => {
     linkBrowser = realBrowser;
     const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
     
-    // ===== 步骤1: 设置网络拦截 =====
-    sendLog('[绑卡链接] 步骤1: 设置网络拦截...');
+    // ===== 设置网络拦截 =====
     let capturedStripeUrl = null;
     
-    page.on('response', async (response) => {
+    page.on('response', async (resp) => {
       try {
-        const url = response.url();
-        if (url.includes('SubscribeToPlan') || url.includes('subscribe')) {
-          const buf = await response.buffer();
-          const text = buf.toString('utf-8');
+        const u = resp.url();
+        if (u.includes('SubscribeToPlan') || u.includes('subscribe')) {
+          const text = (await resp.buffer()).toString('utf-8');
           if (text.includes('https://checkout.stripe.com')) {
-            const start = text.indexOf('https://checkout.stripe.com');
-            let end = start;
-            while (end < text.length && text.charCodeAt(end) >= 32 && !' \n\r\t'.includes(text[end])) end++;
-            capturedStripeUrl = text.substring(start, end);
-            sendLog('[绑卡链接] ✓ 从API响应捕获到Stripe链接！');
+            const s = text.indexOf('https://checkout.stripe.com');
+            let e = s;
+            while (e < text.length && text.charCodeAt(e) >= 32 && !' \n\r\t'.includes(text[e])) e++;
+            capturedStripeUrl = text.substring(s, e);
+            sendLog('[绑卡链接] ✓ 捕获Stripe链接(API)');
           }
         }
       } catch (e) {}
     });
-    
     page.on('framenavigated', (frame) => {
-      if (frame === page.mainFrame()) {
-        const url = frame.url();
-        if (url.includes('checkout.stripe.com') && !capturedStripeUrl) {
-          capturedStripeUrl = url;
-          sendLog('[绑卡链接] ✓ 从页面跳转捕获到Stripe链接！');
-        }
+      if (frame === page.mainFrame() && frame.url().includes('checkout.stripe.com') && !capturedStripeUrl) {
+        capturedStripeUrl = frame.url();
+        sendLog('[绑卡链接] ✓ 捕获Stripe链接(跳转)');
       }
     });
     
-    // ===== 步骤2: 打开定价页 =====
-    sendLog('[绑卡链接] 步骤2: 打开定价页...');
-    await page.goto('https://windsurf.com/pricing', { waitUntil: 'networkidle2', timeout: 30000 });
-    await delay(1500);
-    
-    // ===== 步骤3: 点击 Start Free Trial =====
-    sendLog('[绑卡链接] 步骤3: 点击 Start Free Trial...');
-    
-    // 多种方式点击按钮
-    const trialClicked = await page.evaluate(() => {
-      // 方式1: 找 <a> 标签并直接 click
-      const links = document.querySelectorAll('a');
-      for (const a of links) {
-        const t = (a.textContent || '').trim();
-        if (t === 'Start Free Trial' || t === 'Start free trial') {
-          a.scrollIntoView({ block: 'center' });
-          a.click();
-          return 'a.click: ' + t;
+    // 通用：关闭 Cookie 弹窗
+    async function dismissCookies() {
+      await page.evaluate(() => {
+        for (const b of document.querySelectorAll('button')) {
+          const t = (b.textContent || '').trim();
+          if (t === 'Accept all' || t === 'Reject all' || t === '接受所有') { b.click(); return; }
         }
-      }
-      // 方式2: 找 button
-      const btns = document.querySelectorAll('button, [role="button"]');
-      for (const b of btns) {
-        const t = (b.textContent || '').trim();
-        if (t === 'Start Free Trial' || t === 'Start free trial') {
-          b.scrollIntoView({ block: 'center' });
-          b.click();
-          return 'btn.click: ' + t;
-        }
-      }
-      // 方式3: 找 href 含 billing 的链接
-      for (const a of links) {
-        if (a.href && a.href.includes('billing') && a.href.includes('individual')) {
-          a.scrollIntoView({ block: 'center' });
-          a.click();
-          return 'href.click: ' + a.href;
-        }
-      }
-      return null;
-    });
-    
-    if (trialClicked) {
-      sendLog(`[绑卡链接] ✓ 已点击: ${trialClicked}`);
-    } else {
-      sendLog('[绑卡链接] 按钮未找到，直接导航...');
-      await page.goto('https://windsurf.com/billing/individual?plan_tier=pro', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      }).catch(() => {});
     }
     
-    // ===== 步骤4: 快速循环：Captcha Continue / 登录 / Stripe =====
-    sendLog('[绑卡链接] 步骤4: 等待...');
-    let loginDone = false;
+    // 通用：React 输入框填值
+    async function reactType(selector, value) {
+      await page.evaluate((sel, val) => {
+        const input = document.querySelector(sel);
+        if (!input) return;
+        input.focus();
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(input, val);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }, selector, value);
+      const el = await page.$(selector);
+      if (el) { await el.click({ clickCount: 3 }); await delay(50); await el.type(value, { delay: 10 }); }
+    }
     
-    for (let tick = 0; tick < 180; tick++) {
+    // 通用：坐标点击按钮（先滚动到可见区域）
+    async function clickBtn(textMatch) {
+      const pos = await page.evaluate((match) => {
+        for (const b of document.querySelectorAll('button, a, [role="button"]')) {
+          const t = (b.textContent || '').trim();
+          if (t.includes(match)) {
+            b.scrollIntoView({ block: 'center', behavior: 'instant' });
+            const r = b.getBoundingClientRect();
+            if (r.width > 30 && r.height > 10) {
+              return { x: r.x + r.width / 2, y: r.y + r.height / 2, t };
+            }
+          }
+        }
+        return null;
+      }, textMatch).catch(() => null);
+      if (pos) {
+        await delay(200);
+        await page.mouse.click(pos.x, pos.y);
+        return pos.t;
+      }
+      return null;
+    }
+    
+    // ===== 步骤1: 打开登录页 =====
+    sendLog('[绑卡链接] 步骤1: 打开登录页...');
+    await page.goto('https://windsurf.com/account/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await delay(1500);
+    await dismissCookies();
+    await delay(300);
+    
+    // ===== 步骤2: 自动登录 =====
+    sendLog('[绑卡链接] 步骤2: 登录...');
+    try {
+      await page.waitForSelector('input[type="email"], input[placeholder*="example"]', { timeout: 5000 });
+      await reactType('input[type="email"], input[placeholder*="example"]', email);
+      sendLog('[绑卡链接] ✓ 邮箱');
+    } catch (e) { sendLog('[绑卡链接] ✗ 邮箱: ' + e.message); }
+    await delay(300);
+    
+    let r = await clickBtn('Continue');
+    sendLog('[绑卡链接] ✓ Continue' + (r ? `: ${r}` : ''));
+    await delay(2000);
+    
+    try {
+      await page.waitForSelector('input[type="password"]', { timeout: 5000 });
+      await reactType('input[type="password"]', password);
+      sendLog('[绑卡链接] ✓ 密码');
+    } catch (e) { sendLog('[绑卡链接] ✗ 密码: ' + e.message); }
+    await delay(300);
+    
+    r = await clickBtn('Log in') || await clickBtn('Sign in') || await clickBtn('Continue');
+    sendLog('[绑卡链接] ✓ 登录提交');
+    await delay(4000);
+    
+    // ===== 步骤3: 登录后点 Upgrade to Pro =====
+    sendLog('[绑卡链接] 步骤3: 查找 Upgrade...');
+    let upgraded = false;
+    for (let i = 0; i < 10; i++) {
+      const url = page.url();
+      if (url.includes('checkout.stripe.com')) { capturedStripeUrl = url; break; }
+      
+      const upg = await clickBtn('Upgrade to Pro');
+      if (upg) {
+        sendLog(`[绑卡链接] ✓ 点击: ${upg}`);
+        upgraded = true;
+        await delay(2000);
+        break;
+      }
+      // 也尝试直接导航到 pricing
+      if (i === 5 && !upgraded) {
+        sendLog('[绑卡链接] Upgrade 未找到，导航到 pricing...');
+        await page.goto('https://windsurf.com/pricing', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await delay(1500);
+        const trial = await clickBtn('Start Free Trial');
+        if (trial) { sendLog('[绑卡链接] ✓ Start Free Trial'); await delay(2000); break; }
+      }
+      await delay(1000);
+    }
+    
+    // ===== 步骤4: 等待 Start Free Trial / Captcha Continue / 重新登录 / Stripe =====
+    sendLog('[绑卡链接] 步骤4: 等待...');
+    let trialClicked = false;
+    let reloginDone = false;
+    
+    for (let tick = 0; tick < 120; tick++) {
       await delay(500);
       if (capturedStripeUrl) break;
       
       const url = page.url();
       if (url.includes('checkout.stripe.com')) { capturedStripeUrl = url; break; }
       
-      // ==== 每次都尝试点 Continue（弹窗里的） ====
-      const contResult = await page.evaluate(() => {
-        const all = document.querySelectorAll('button, a, [role="button"]');
-        const visible = [];
-        for (const el of all) {
-          const t = (el.textContent || '').trim();
-          const r = el.getBoundingClientRect();
-          if (r.width > 50 && r.height > 20 && t.includes('Continue') && !t.includes('Google') && !t.includes('GitHub') && !t.includes('Devin') && !t.includes('SSO')) {
-            visible.push(t);
-            el.click();
-            el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-            return { clicked: true, text: t };
-          }
-        }
-        return { clicked: false, found: visible };
-      }).catch(() => ({ clicked: false }));
-      
-      if (contResult.clicked) {
-        sendLog(`[绑卡链接] ✓ 点击 Continue: "${contResult.text}"`);
+      // 检测是否跳回登录页（Turnstile后重定向）→ 重新登录
+      if (!reloginDone && (url.includes('/account/login') || url.includes('/login')) && trialClicked) {
+        reloginDone = true;
+        sendLog('[绑卡链接] 检测到重新登录页，自动登录...');
         await delay(1000);
+        try {
+          await page.waitForSelector('input[type="email"], input[placeholder*="example"]', { timeout: 5000 });
+          await reactType('input[type="email"], input[placeholder*="example"]', email);
+        } catch (e) {}
+        await delay(300);
+        await clickBtn('Continue');
+        await delay(2000);
+        try {
+          await page.waitForSelector('input[type="password"]', { timeout: 5000 });
+          await reactType('input[type="password"]', password);
+        } catch (e) {}
+        await delay(300);
+        let loginR = await clickBtn('Log in');
+        if (!loginR) loginR = await clickBtn('Sign in');
+        if (!loginR) loginR = await clickBtn('Continue');
+        sendLog('[绑卡链接] ✓ 重新登录提交');
+        await delay(5000);
         continue;
       }
       
-      // ==== 登录页 ====
-      if (!loginDone && (url.includes('/account/login') || url.includes('/login'))) {
-        loginDone = true;
-        sendLog('[绑卡链接] 登录页...');
-        
-        try {
-          await page.waitForSelector('input[type="email"], input[placeholder*="example"]', { timeout: 3000 });
-          const ei = await page.$('input[type="email"], input[placeholder*="example"]');
-          if (ei) { await ei.click({ clickCount: 3 }); await ei.type(email, { delay: 20 }); }
-        } catch (e) {}
-        
-        await delay(300);
-        await page.evaluate(() => {
-          for (const b of document.querySelectorAll('button')) {
-            if ((b.textContent||'').includes('Continue')) { b.click(); return; }
+      // 优先：点 Start Free Trial
+      if (!trialClicked) {
+        const trial = await clickBtn('Start Free Trial');
+        if (trial) {
+          sendLog(`[绑卡链接] ✓ ${trial}`);
+          trialClicked = true;
+          await delay(1500);
+          continue;
+        }
+      }
+      
+      // 点 Captcha 弹窗的 Continue
+      const contPos = await page.evaluate(() => {
+        for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+          const t = (el.textContent || '').trim();
+          const r = el.getBoundingClientRect();
+          if (r.width > 50 && r.height > 20 && r.top > 0 && r.top < window.innerHeight) {
+            if (t === 'Continue' && !t.includes('→')) {
+              return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+            }
           }
-        }).catch(() => {});
-        
-        await delay(1500);
-        
-        try {
-          await page.waitForSelector('input[type="password"]', { timeout: 3000 });
-          const pi = await page.$('input[type="password"]');
-          if (pi) { await pi.click(); await pi.type(password, { delay: 20 }); }
-        } catch (e) {}
-        
-        await delay(300);
-        await page.evaluate(() => {
-          for (const b of document.querySelectorAll('button, input[type="submit"]')) {
-            const t = (b.textContent || b.value || '').trim();
-            if (t.includes('Log in') || t.includes('Sign in') || t.includes('Continue')) { b.click(); return; }
-          }
-        }).catch(() => {});
-        sendLog('[绑卡链接] ✓ 登录提交');
-        await delay(2000);
+        }
+        return null;
+      }).catch(() => null);
+      
+      if (contPos) {
+        sendLog(`[绑卡链接] Continue(${Math.round(contPos.x)},${Math.round(contPos.y)}) → 点击`);
+        await page.mouse.click(contPos.x, contPos.y);
+        await delay(500);
+        await page.mouse.click(contPos.x, contPos.y);
+        await delay(500);
       }
       
       if (tick > 0 && tick % 20 === 0) {
@@ -1981,7 +2167,7 @@ ipcMain.handle('get-payment-link', async (event, request = {}) => {
       }
     }
     
-    // 关闭浏览器
+    // 关闭后台浏览器
     try { await linkBrowser.close(); linkBrowser = null; } catch (e) {}
     
     if (!capturedStripeUrl) {
@@ -1989,7 +2175,7 @@ ipcMain.handle('get-payment-link', async (event, request = {}) => {
     }
     
     sendLog(`[绑卡链接] ✓ 成功获取试用链接`);
-    console.log(`[绑卡链接] 试用链接: ${capturedStripeUrl.substring(0, 80)}...`);
+    console.log(`[绑卡链接] 链接: ${capturedStripeUrl.substring(0, 80)}...`);
     return { success: true, paymentLink: capturedStripeUrl };
     
   } catch (error) {
@@ -2104,147 +2290,194 @@ ipcMain.handle('auto-fill-payment', async (event, { paymentLink, card, billing }
     
     await delay(500);
     
-    sendLog('[自动填写] 点击银行卡选项...');
+    // ===== 选择支付宝 =====
+    sendLog('[自动填写] 选择支付宝...');
+    
+    let alipayDone = false;
+    
+    // 方法1: 找"支付宝"精确文本节点位置，点击其左侧 radio
     try {
-      const clicked = await page.evaluate(() => {
-        const selectors = [
-          'button[data-testid="card-accordion-item-button"]',
-          '[data-testid="card-tab"]',
-          'button[aria-label*="Card"]',
-          'button[aria-label*="银行卡"]',
-        ];
-        for (const sel of selectors) {
-          try {
-            const el = document.querySelector(sel);
-            if (el) { el.click(); return sel; }
-          } catch (e) {}
-        }
-        
-        const radioLabels = document.querySelectorAll('label, div[role="radio"], div[role="button"], span, button');
-        for (const el of radioLabels) {
-          const text = (el.textContent || '').trim();
-          if (text.includes('银行卡') || text === 'Card' || text.includes('Credit or debit')) {
-            el.click();
-            const radio = el.querySelector('input[type="radio"]');
-            if (radio) radio.click();
-            return 'text:' + text.substring(0, 20);
+      const pos = await page.evaluate(() => {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+          const t = walker.currentNode.textContent.trim();
+          if (t === '支付宝' || t === 'Alipay') {
+            const range = document.createRange();
+            range.selectNodeContents(walker.currentNode);
+            const r = range.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              // 点击文本左侧约50px处（radio 按钮的位置）
+              return { x: r.x - 30, y: r.y + r.height / 2, textX: r.x, textY: r.y };
+            }
           }
-        }
-        
-        const firstRadio = document.querySelector('input[type="radio"]');
-        if (firstRadio) {
-          firstRadio.click();
-          const label = firstRadio.closest('label') || firstRadio.parentElement;
-          if (label) label.click();
-          return 'first-radio';
         }
         return null;
       });
-      if (clicked) sendLog(`[自动填写] 已点击: ${clicked}`);
-      await delay(1500);
-    } catch (e) {
-      sendLog('[自动填写] 点击失败: ' + e.message);
-    }
+      if (pos) {
+        // 先点 radio 区域
+        await page.mouse.click(pos.x, pos.y);
+        await delay(300);
+        // 再点文本本身
+        await page.mouse.click(pos.textX + 10, pos.textY + 8);
+        sendLog(`[自动填写] ✓ 支付宝(文本坐标 ${Math.round(pos.textX)},${Math.round(pos.textY)})`);
+        alipayDone = true;
+      }
+    } catch (e) {}
     
-    await delay(1000);
+    await delay(500);
     
-    sendLog('[自动填写] 填写卡片信息...');
-    const frames = page.frames();
-    sendLog(`[自动填写] 找到 ${frames.length} 个 frame`);
-    
-    let cardFilled = false, expFilled = false, cvvFilled = false;
-    
-    for (const frame of frames) {
+    // 方法2: 遍历 radio，找相邻文本含"支付宝"的那个
+    if (!alipayDone) {
       try {
-        if (!cardFilled) {
-          for (const sel of ['input[name="cardnumber"]', 'input[autocomplete="cc-number"]', 'input[data-elements-stable-field-name="cardNumber"]']) {
-            const el = await frame.$(sel);
-            if (el) {
-              await el.click(); await delay(100);
-              await el.type(card.cardNumber, { delay: 20 });
-              sendLog('[自动填写] ✓ 卡号已填写');
-              cardFilled = true; break;
+        const pos2 = await page.evaluate(() => {
+          const radios = document.querySelectorAll('input[type="radio"]');
+          for (const radio of radios) {
+            // 检查同一容器内的文本
+            const container = radio.closest('[class*="accordion"], [class*="Accordion"], label, li, div') || radio.parentElement;
+            if (container) {
+              const text = container.textContent || '';
+              if (text.includes('支付宝') || text.includes('Alipay')) {
+                if (!text.includes('银行卡') && !text.includes('Bank')) {
+                  container.scrollIntoView({ block: 'center' });
+                  const r = radio.getBoundingClientRect();
+                  return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                }
+              }
             }
           }
-        }
-        if (!expFilled) {
-          for (const sel of ['input[name="exp-date"]', 'input[autocomplete="cc-exp"]', 'input[data-elements-stable-field-name="cardExpiry"]']) {
-            const el = await frame.$(sel);
-            if (el) {
-              await el.click(); await delay(100);
-              await el.type(`${card.month}${card.year}`, { delay: 20 });
-              sendLog('[自动填写] ✓ 有效期已填写');
-              expFilled = true; break;
-            }
+          // 备用：第2个 radio
+          if (radios.length >= 2) {
+            const r = radios[1].getBoundingClientRect();
+            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
           }
-        }
-        if (!cvvFilled) {
-          const cvv3 = String(card.cvv).padStart(3, '0');
-          for (const sel of ['input[name="cvc"]', 'input[autocomplete="cc-csc"]', 'input[data-elements-stable-field-name="cardCvc"]']) {
-            const el = await frame.$(sel);
-            if (el) {
-              await el.click(); await delay(100);
-              await el.type(cvv3, { delay: 20 });
-              sendLog(`[自动填写] ✓ CVV已填写: ${cvv3}`);
-              cvvFilled = true; break;
-            }
-          }
+          return null;
+        });
+        if (pos2) {
+          await page.mouse.click(pos2.x, pos2.y);
+          sendLog('[自动填写] ✓ 支付宝(radio)');
+          alipayDone = true;
         }
       } catch (e) {}
     }
     
-    sendLog(`[自动填写] 卡片: 卡号=${cardFilled}, 有效期=${expFilled}, CVV=${cvvFilled}`);
+    await delay(1500);
     
+    // ===== 填写姓名 =====
     sendLog('[自动填写] 填写账单信息...');
-    try { await page.type('input[name="billingName"], input[placeholder*="Name"]', billing.name, { delay: 30 }); sendLog('[自动填写] ✓ 姓名'); } catch (e) {}
-    try { await page.select('select[name="billingCountry"]', billing.country); } catch (e) {}
-    await delay(1000);
-    try { const prov = billing.province || billing.state; if (prov) { await page.select('select[id="billingAdministrativeArea"], select[name="billingAdministrativeArea"]', prov); sendLog('[自动填写] ✓ 省份'); } } catch (e) {}
-    try { if (billing.city) { await page.type('input[name="billingLocality"], input[id="billingLocality"]', billing.city, { delay: 30 }); sendLog('[自动填写] ✓ 城市'); } } catch (e) {}
-    try { if (billing.district) { await page.type('input[id="billingDependentLocality"], input[name="billingDependentLocality"]', billing.district, { delay: 30 }); } } catch (e) {}
-    try { if (billing.address) { await page.type('input[name="billingAddressLine1"], input[id="billingAddressLine1"]', billing.address, { delay: 30 }); sendLog('[自动填写] ✓ 地址'); } } catch (e) {}
-    try { if (billing.address2) { await page.type('input[id="billingAddressLine2"], input[name="billingAddressLine2"]', billing.address2, { delay: 30 }); } } catch (e) {}
-    try { if (billing.postalCode) { await page.type('input[name="billingPostalCode"], input[id="billingPostalCode"]', billing.postalCode, { delay: 30 }); sendLog('[自动填写] ✓ 邮编'); } } catch (e) {}
-    
-    sendLog('[自动填写] 勾选同意条款...');
-    await delay(500);
     try {
-      const checked = await page.evaluate(() => {
+      await page.evaluate((name) => {
+        const input = document.querySelector('input[name="billingName"], input[placeholder*="Name"], input[placeholder*="姓名"]');
+        if (input) {
+          input.focus();
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          setter.call(input, name);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, billing.name);
+      const nameInput = await page.$('input[name="billingName"], input[placeholder*="Name"], input[placeholder*="姓名"]');
+      if (nameInput) { await nameInput.click({ clickCount: 3 }); await delay(50); await nameInput.type(billing.name, { delay: 15 }); }
+      sendLog('[自动填写] ✓ 姓名');
+    } catch (e) {}
+    
+    // ===== 选择国家 =====
+    try {
+      await page.select('select[name="billingCountry"]', billing.country || 'CN');
+      sendLog('[自动填写] ✓ 国家');
+    } catch (e) {}
+    await delay(800);
+    
+    // ===== 填写邮编 =====
+    try {
+      if (billing.postalCode) {
+        const postInput = await page.$('input[name="billingPostalCode"], input[id="billingPostalCode"]');
+        if (postInput) { await postInput.click({ clickCount: 3 }); await delay(50); await postInput.type(billing.postalCode, { delay: 15 }); sendLog('[自动填写] ✓ 邮编'); }
+      }
+    } catch (e) {}
+    
+    // ===== 选择省份 =====
+    try {
+      const prov = billing.province || billing.state;
+      if (prov) {
+        await page.select('select[id="billingAdministrativeArea"], select[name="billingAdministrativeArea"]', prov);
+        sendLog('[自动填写] ✓ 省份');
+      }
+    } catch (e) {}
+    await delay(300);
+    
+    // ===== 填写城市 =====
+    try {
+      if (billing.city) {
+        const cityInput = await page.$('input[name="billingLocality"], input[id="billingLocality"]');
+        if (cityInput) { await cityInput.click({ clickCount: 3 }); await delay(50); await cityInput.type(billing.city, { delay: 15 }); sendLog('[自动填写] ✓ 城市'); }
+      }
+    } catch (e) {}
+    
+    // ===== 填写地区 =====
+    try {
+      if (billing.district) {
+        const distInput = await page.$('input[id="billingDependentLocality"], input[name="billingDependentLocality"]');
+        if (distInput) { await distInput.click({ clickCount: 3 }); await delay(50); await distInput.type(billing.district, { delay: 15 }); }
+      }
+    } catch (e) {}
+    
+    // ===== 填写地址 =====
+    try {
+      if (billing.address) {
+        const addrInput = await page.$('input[name="billingAddressLine1"], input[id="billingAddressLine1"]');
+        if (addrInput) { await addrInput.click({ clickCount: 3 }); await delay(50); await addrInput.type(billing.address, { delay: 15 }); sendLog('[自动填写] ✓ 地址'); }
+      }
+    } catch (e) {}
+    try {
+      if (billing.address2) {
+        const addr2Input = await page.$('input[id="billingAddressLine2"], input[name="billingAddressLine2"]');
+        if (addr2Input) { await addr2Input.click({ clickCount: 3 }); await delay(50); await addr2Input.type(billing.address2, { delay: 15 }); }
+      }
+    } catch (e) {}
+    
+    // ===== 勾选同意条款 =====
+    sendLog('[自动填写] 勾选条款...');
+    await delay(300);
+    try {
+      await page.evaluate(() => {
         const cbs = document.querySelectorAll('input[type="checkbox"]');
-        for (const cb of cbs) { if (!cb.checked) { cb.click(); return 'checkbox'; } }
+        for (const cb of cbs) { if (!cb.checked) { cb.click(); return; } }
         const labels = document.querySelectorAll('label, div[role="checkbox"], span[role="checkbox"], [class*="Checkbox"]');
         for (const el of labels) {
           const text = (el.textContent || '').toLowerCase();
-          if (text.includes('agree') || text.includes('terms') || text.includes('同意') || text.includes('条款')) { el.click(); return 'label'; }
+          if (text.includes('agree') || text.includes('terms') || text.includes('同意') || text.includes('条款')) { el.click(); return; }
         }
-        return null;
       });
-      if (checked) sendLog(`[自动填写] ✓ 条款已勾选`);
+      sendLog('[自动填写] ✓ 条款');
     } catch (e) {}
     
-    sendLog('[自动填写] 点击订阅按钮...');
-    await delay(1000);
+    // ===== 点击订阅 =====
+    sendLog('[自动填写] 点击订阅...');
+    await delay(500);
     try {
       const submitClicked = await page.evaluate(() => {
-        const btnSelectors = ['button[type="submit"]', 'button[data-testid="hosted-payment-submit-button"]', 'button.SubmitButton', 'button[class*="Submit"]'];
-        for (const sel of btnSelectors) {
-          try { const btn = document.querySelector(sel); if (btn && !btn.disabled) { btn.click(); return sel; } } catch (e) {}
+        // 优先用 submit 按钮
+        for (const sel of ['button[type="submit"]', 'button[data-testid="hosted-payment-submit-button"]', 'button.SubmitButton', 'button[class*="Submit"]']) {
+          const btn = document.querySelector(sel);
+          if (btn && !btn.disabled) { btn.click(); return sel; }
         }
-        const buttons = document.querySelectorAll('button, [role="button"]');
-        for (const btn of buttons) {
-          const text = (btn.textContent || '').trim();
-          if ((text.includes('订阅') || text.includes('Subscribe') || text.includes('Pay') || text.includes('Submit')) && !btn.disabled) { btn.click(); return 'text:' + text.substring(0, 20); }
+        // 文本匹配
+        for (const btn of document.querySelectorAll('button, [role="button"]')) {
+          const t = (btn.textContent || '').trim();
+          if ((t.includes('订阅') || t.includes('Subscribe') || t.includes('Pay') || t.includes('Submit')) && !btn.disabled) {
+            btn.click(); return 'text:' + t.substring(0, 20);
+          }
         }
         return null;
       });
-      if (submitClicked) sendLog(`[自动填写] ✓ 已点击订阅按钮`);
-      else sendLog('[自动填写] 未找到订阅按钮，请手动提交');
+      if (submitClicked) sendLog(`[自动填写] ✓ 订阅: ${submitClicked}`);
+      else sendLog('[自动填写] 未找到订阅按钮');
     } catch (e) {}
     
-    sendLog('[自动填写] 填写完成，等待支付结果...');
+    sendLog('[自动填写] 填写完成，等待支付结果（最长3分钟，请扫码完成支付）...');
     
     try {
-      await page.waitForNavigation({ timeout: 60000, waitUntil: 'domcontentloaded' });
+      await page.waitForNavigation({ timeout: 180000, waitUntil: 'domcontentloaded' });
       const finalUrl = page.url();
       if (finalUrl.includes('payment-success') || finalUrl.includes('success')) {
         sendLog('[自动填写] ✅ 支付成功！');

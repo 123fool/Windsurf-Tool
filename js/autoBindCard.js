@@ -993,6 +993,23 @@ const AutoBindCard = {
     if (typeof lucide !== 'undefined') lucide.createIcons();
     
     try {
+      // 0. 检测账号是否已开通 Trial
+      this.updateStatus('正在检测账号订阅状态...');
+      const checkResult = await window.ipcRenderer.invoke('check-account-plan', { accountId });
+      if (checkResult && checkResult.success && checkResult.planName) {
+        const plan = checkResult.planName.toLowerCase();
+        if (plan.includes('trial') || plan.includes('pro') || plan.includes('enterprise') || plan.includes('team')) {
+          this.updateStatus(`该账号已是 ${checkResult.planName}，无需绑卡`, 'warning');
+          btn.disabled = false;
+          btn.innerHTML = '<i data-lucide="play" style="width: 16px; height: 16px;"></i> 开始绑卡';
+          if (typeof lucide !== 'undefined') lucide.createIcons();
+          if (typeof showCenterMessage === 'function') {
+            showCenterMessage(`该账号已是 ${checkResult.planName}${checkResult.expiresAt ? '，到期: ' + new Date(checkResult.expiresAt).toLocaleDateString('zh-CN') : ''}`, 'warning');
+          }
+          return;
+        }
+      }
+      
       // 1. 获取支付链接
       this.updateStatus('正在获取支付链接...');
       
@@ -1577,6 +1594,25 @@ const AutoBindCard = {
     }
     
     try {
+      // 0. 检测账号是否已开通 Trial
+      this.updateStatusView('正在检测账号订阅状态...');
+      const checkResult = await window.ipcRenderer.invoke('check-account-plan', { accountId });
+      if (checkResult && checkResult.success && checkResult.planName) {
+        const plan = checkResult.planName.toLowerCase();
+        if (plan.includes('trial') || plan.includes('pro') || plan.includes('enterprise') || plan.includes('team')) {
+          this.updateStatusView(`该账号已是 ${checkResult.planName}，无需绑卡`, 'warning');
+          if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = '<i data-lucide="play" style="width: 16px; height: 16px;"></i> 开始绑卡';
+            if (typeof lucide !== 'undefined') lucide.createIcons();
+          }
+          if (typeof showCenterMessage === 'function') {
+            showCenterMessage(`该账号已是 ${checkResult.planName}${checkResult.expiresAt ? '，到期: ' + new Date(checkResult.expiresAt).toLocaleDateString('zh-CN') : ''}`, 'warning');
+          }
+          return;
+        }
+      }
+      
       // 1. 获取支付链接
       this.updateStatusView('正在获取支付链接...');
       
@@ -1629,6 +1665,10 @@ const AutoBindCard = {
         if (autoFillResult.success) {
           this.updateStatusView('自动填写完成，请在浏览器中确认并点击订阅按钮', 'success');
           this.addAutoFillLog('✓ 自动填写完成', 'success');
+          // 标记为 Trial，避免重复绑卡
+          try {
+            await window.ipcRenderer.invoke('update-account', { id: accountId, type: 'Trial', cardBound: true, cardBoundAt: new Date().toISOString() });
+          } catch (e) {}
         } else {
           this.updateStatusView('自动填写失败: ' + autoFillResult.error, 'error');
           this.addAutoFillLog('✗ ' + autoFillResult.error, 'error');
@@ -1734,6 +1774,229 @@ const AutoBindCard = {
     
     document.body.appendChild(modal);
     if (typeof lucide !== 'undefined') lucide.createIcons();
+  },
+
+  // 批量绑卡取消标志
+  _batchCancelled: false,
+
+  /**
+   * 取消批量绑卡
+   */
+  cancelBatchBind() {
+    this._batchCancelled = true;
+    this.addBatchLog('⏹ 用户取消批量绑卡，当前账号完成后停止...', 'warning');
+  },
+
+  /**
+   * 添加批量绑卡日志
+   */
+  addBatchLog(message, type = 'info') {
+    const container = document.getElementById('batchBindLogContent');
+    if (!container) return;
+    
+    const colors = { info: '#a1a1aa', success: '#22c55e', error: '#ef4444', warning: '#f59e0b' };
+    const div = document.createElement('div');
+    div.style.color = colors[type] || colors.info;
+    div.textContent = `[${new Date().toLocaleTimeString('zh-CN')}] ${message}`;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+  },
+
+  /**
+   * 处理单个账号绑卡（供并行调用）
+   */
+  async _processOneAccount(acc, index, total) {
+    const tag = `[${index + 1}/${total}]`;
+    this.addBatchLog(`${tag} 处理 ${acc.email}...`);
+    
+    try {
+      // 1. 检测是否已是 Trial
+      const checkResult = await window.ipcRenderer.invoke('check-account-plan', { accountId: acc.id });
+      if (checkResult && checkResult.success && checkResult.planName) {
+        const plan = checkResult.planName.toLowerCase();
+        if (plan.includes('trial') || plan.includes('pro') || plan.includes('enterprise') || plan.includes('team')) {
+          this.addBatchLog(`${tag} ⏭ ${acc.email} 已是 ${checkResult.planName}，跳过`, 'warning');
+          return 'skip';
+        }
+      }
+      
+      // 2. 获取支付链接
+      this.addBatchLog(`${tag} 获取支付链接...`);
+      const linkResult = await window.ipcRenderer.invoke('get-payment-link', { accountId: acc.id });
+      
+      if (!linkResult.success || !linkResult.paymentLink) {
+        this.addBatchLog(`${tag} ✗ ${acc.email} 获取链接失败: ${linkResult.error || '未知'}`, 'error');
+        return 'fail';
+      }
+      this.addBatchLog(`${tag} ✓ ${acc.email} 获取链接成功`);
+      
+      // 3. 准备卡片信息
+      let cardInfo;
+      if (this.config.cardMode === 'bin') {
+        cardInfo = this.generateCardInfo();
+      } else {
+        cardInfo = {
+          cardNumber: this.config.cardNumber,
+          month: this.config.cardExpMonth,
+          year: this.config.cardExpYear,
+          cvv: this.config.cardCvv
+        };
+      }
+      
+      // 4. 自动填写（每个账号随机生成账单信息）
+      const country = this.config.billingCountry || 'CN';
+      const randomName = this.generateRandomName(country);
+      const randomAddr = this.generateRandomAddress(country);
+      this.addBatchLog(`${tag} 自动填写 ${acc.email}（${randomName}）...`);
+      const autoFillResult = await window.ipcRenderer.invoke('auto-fill-payment', {
+        paymentLink: linkResult.paymentLink,
+        card: cardInfo,
+        billing: {
+          name: randomName,
+          country: country,
+          state: randomAddr.province,
+          city: randomAddr.city,
+          district: randomAddr.district || '',
+          address: randomAddr.address,
+          address2: randomAddr.address2 || '',
+          postalCode: randomAddr.postalCode || ''
+        },
+        batchMode: true
+      });
+      
+      if (autoFillResult.success) {
+        this.addBatchLog(`${tag} ✓ ${acc.email} 绑卡完成`, 'success');
+        try {
+          await window.ipcRenderer.invoke('update-account', { id: acc.id, type: 'Trial', cardBound: true, cardBoundAt: new Date().toISOString() });
+        } catch (e) {}
+        return 'success';
+      } else {
+        this.addBatchLog(`${tag} ✗ ${acc.email} ${autoFillResult.error || '填写失败'}`, 'error');
+        return 'fail';
+      }
+    } catch (error) {
+      this.addBatchLog(`${tag} ✗ ${acc.email} 异常: ${error.message}`, 'error');
+      return 'fail';
+    }
+  },
+
+  /**
+   * 批量绑卡 - 并行处理所有 Free 账号
+   */
+  async batchStartFromView() {
+    // 保存配置
+    this.saveViewConfig();
+    
+    // 验证必填项
+    if (!this.config.billingName) {
+      if (typeof showCenterMessage === 'function') showCenterMessage('请填写持卡人姓名', 'warning');
+      return;
+    }
+    
+    // 读取并行数
+    const concurrencyEl = document.getElementById('batchBindConcurrency');
+    const concurrency = parseInt(concurrencyEl?.value || '2');
+    
+    // 获取所有 Free 账号
+    const result = await window.ipcRenderer.invoke('get-accounts');
+    const allAccounts = result.success ? result.accounts : [];
+    const freeAccounts = allAccounts.filter(acc => {
+      const t = (acc.type || '').toLowerCase().trim();
+      return !t || t === 'free' || t === '-';
+    });
+    
+    if (freeAccounts.length === 0) {
+      if (typeof showCenterMessage === 'function') showCenterMessage('没有可绑卡的 Free 账号', 'warning');
+      return;
+    }
+    
+    // 确认
+    let confirmed = false;
+    if (typeof showCustomConfirm === 'function') {
+      confirmed = await showCustomConfirm({
+        title: '批量绑卡',
+        message: `确定批量绑卡 ${freeAccounts.length} 个 Free 账号？（${concurrency} 并行）`,
+        subMessage: '每个账号需要等待扫码完成支付',
+        confirmText: '开始批量绑卡',
+        type: 'warning'
+      });
+    } else {
+      confirmed = confirm(`确定批量绑卡 ${freeAccounts.length} 个 Free 账号？`);
+    }
+    if (!confirmed) return;
+    
+    // 初始化 UI
+    this._batchCancelled = false;
+    const batchBtn = document.getElementById('batchAutoBindBtn');
+    const singleBtn = document.getElementById('startAutoBindBtn');
+    const cancelBtn = document.getElementById('cancelBatchBindBtn');
+    const logArea = document.getElementById('batchBindLogArea');
+    const progressEl = document.getElementById('batchBindProgress');
+    const logContent = document.getElementById('batchBindLogContent');
+    
+    if (batchBtn) { batchBtn.disabled = true; batchBtn.innerHTML = '<i data-lucide="loader-2" style="width: 16px; height: 16px; animation: spin 1s linear infinite;"></i> 批量处理中...'; }
+    if (singleBtn) singleBtn.disabled = true;
+    if (cancelBtn) cancelBtn.style.display = 'block';
+    if (logArea) logArea.style.display = 'block';
+    if (logContent) logContent.innerHTML = '';
+    if (typeof lucide !== 'undefined') lucide.createIcons();
+    
+    this.addBatchLog(`开始批量绑卡，共 ${freeAccounts.length} 个账号，并行数: ${concurrency}`);
+    
+    let successCount = 0;
+    let failCount = 0;
+    let skipCount = 0;
+    let doneCount = 0;
+    
+    // 并行处理：按 concurrency 分批
+    for (let batchStart = 0; batchStart < freeAccounts.length; batchStart += concurrency) {
+      if (this._batchCancelled) {
+        this.addBatchLog(`已取消`, 'warning');
+        break;
+      }
+      
+      const batch = freeAccounts.slice(batchStart, batchStart + concurrency);
+      this.addBatchLog(`--- 第 ${Math.floor(batchStart / concurrency) + 1} 批（${batch.length} 个）---`);
+      
+      // 并行执行当前批次
+      const promises = batch.map((acc, i) => {
+        const globalIdx = batchStart + i;
+        return this._processOneAccount(acc, globalIdx, freeAccounts.length);
+      });
+      
+      const results = await Promise.all(promises);
+      
+      // 统计
+      for (const r of results) {
+        doneCount++;
+        if (r === 'success') successCount++;
+        else if (r === 'skip') skipCount++;
+        else failCount++;
+        await this.incrementUsage();
+      }
+      
+      this.updateUsageDisplay();
+      if (progressEl) progressEl.textContent = `${doneCount} / ${freeAccounts.length}  (✓${successCount} ✗${failCount} ⏭${skipCount})`;
+      this.updateStatusView(`批量绑卡 ${doneCount}/${freeAccounts.length}: 成功${successCount} 失败${failCount} 跳过${skipCount}`);
+    }
+    
+    // 完成
+    const summary = `批量绑卡完成: 成功 ${successCount}, 失败 ${failCount}, 跳过 ${skipCount}`;
+    this.addBatchLog(summary, successCount > 0 ? 'success' : 'warning');
+    this.updateStatusView(summary, successCount > 0 ? 'success' : 'warning');
+    if (typeof showCenterMessage === 'function') showCenterMessage(summary, 'success');
+    
+    // 恢复 UI
+    if (batchBtn) { batchBtn.disabled = false; batchBtn.innerHTML = '<i data-lucide="layers" style="width: 16px; height: 16px;"></i> 批量绑卡'; }
+    if (singleBtn) singleBtn.disabled = false;
+    if (cancelBtn) cancelBtn.style.display = 'none';
+    if (typeof lucide !== 'undefined') lucide.createIcons();
+    
+    // 刷新账号列表
+    this.refreshAccountList();
+    if (typeof AccountManager !== 'undefined' && AccountManager.loadAccounts) {
+      await AccountManager.loadAccounts();
+    }
   },
 
   /**
