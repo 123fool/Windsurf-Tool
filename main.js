@@ -2451,28 +2451,41 @@ ipcMain.handle('auto-fill-payment', async (event, { paymentLink, card, billing }
       sendLog('[自动填写] ✓ 条款');
     } catch (e) {}
     
-    // ===== 点击订阅 =====
+    // ===== 点击订阅（物理鼠标点击，重试10次） =====
     sendLog('[自动填写] 点击订阅...');
-    await delay(500);
-    try {
-      const submitClicked = await page.evaluate(() => {
-        // 优先用 submit 按钮
-        for (const sel of ['button[type="submit"]', 'button[data-testid="hosted-payment-submit-button"]', 'button.SubmitButton', 'button[class*="Submit"]']) {
-          const btn = document.querySelector(sel);
-          if (btn && !btn.disabled) { btn.click(); return sel; }
-        }
-        // 文本匹配
-        for (const btn of document.querySelectorAll('button, [role="button"]')) {
-          const t = (btn.textContent || '').trim();
-          if ((t.includes('订阅') || t.includes('Subscribe') || t.includes('Pay') || t.includes('Submit')) && !btn.disabled) {
-            btn.click(); return 'text:' + t.substring(0, 20);
+    let submitClicked = null;
+    for (let retry = 0; retry < 10; retry++) {
+      await delay(1000);
+      try {
+        const btnPos = await page.evaluate(() => {
+          for (const sel of ['button[type="submit"]', 'button[data-testid="hosted-payment-submit-button"]', 'button.SubmitButton']) {
+            const btn = document.querySelector(sel);
+            if (btn) {
+              btn.scrollIntoView({ block: 'center' });
+              const r = btn.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) return { x: r.x + r.width / 2, y: r.y + r.height / 2, sel, text: btn.textContent.trim().substring(0, 20) };
+            }
           }
+          for (const btn of document.querySelectorAll('button, [role="button"]')) {
+            const t = (btn.textContent || '').trim();
+            if (t.includes('订阅') || t.includes('试用') || t.includes('Subscribe') || t.includes('Start') || t.includes('Pay') || t.includes('Submit')) {
+              btn.scrollIntoView({ block: 'center' });
+              const r = btn.getBoundingClientRect();
+              if (r.width > 0 && r.height > 0) return { x: r.x + r.width / 2, y: r.y + r.height / 2, sel: 'text', text: t.substring(0, 20) };
+            }
+          }
+          return null;
+        });
+        if (btnPos) {
+          await page.mouse.click(btnPos.x, btnPos.y);
+          submitClicked = `${btnPos.sel}(${btnPos.text}) @ (${Math.round(btnPos.x)},${Math.round(btnPos.y)})`;
+          sendLog(`[自动填写] ✓ 点击订阅: ${submitClicked}`);
+          break;
         }
-        return null;
-      });
-      if (submitClicked) sendLog(`[自动填写] ✓ 订阅: ${submitClicked}`);
-      else sendLog('[自动填写] 未找到订阅按钮');
-    } catch (e) {}
+      } catch (e) {}
+      sendLog(`[自动填写] 等待订阅按钮... (${retry + 1}/10)`);
+    }
+    if (!submitClicked) sendLog('[自动填写] 未找到订阅按钮，请手动点击');
     
     sendLog('[自动填写] 填写完成，等待支付结果（最长3分钟，请扫码完成支付）...');
     

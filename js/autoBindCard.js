@@ -1810,12 +1810,11 @@ const AutoBindCard = {
     this.addBatchLog(`${tag} 处理 ${acc.email}...`);
     
     try {
-      // 1. 检测是否已是 Trial
-      const checkResult = await window.ipcRenderer.invoke('check-account-plan', { accountId: acc.id });
-      if (checkResult && checkResult.success && checkResult.planName) {
-        const plan = checkResult.planName.toLowerCase();
-        if (plan.includes('trial') || plan.includes('pro') || plan.includes('enterprise') || plan.includes('team')) {
-          this.addBatchLog(`${tag} ⏭ ${acc.email} 已是 ${checkResult.planName}，跳过`, 'warning');
+      // 1. 快速检测是否已是 Trial（本地类型是 Free 或空则跳过远程检测直接绑卡）
+      const localType = (acc.type || '').toLowerCase();
+      if (localType && localType !== 'free' && localType !== '-' && localType !== '') {
+        if (localType.includes('trial') || localType.includes('pro') || localType.includes('enterprise') || localType.includes('team')) {
+          this.addBatchLog(`${tag} ⏭ ${acc.email} 已是 ${acc.type}，跳过`, 'warning');
           return 'skip';
         }
       }
@@ -1948,37 +1947,36 @@ const AutoBindCard = {
     let skipCount = 0;
     let doneCount = 0;
     
-    // 并行处理：按 concurrency 分批
-    for (let batchStart = 0; batchStart < freeAccounts.length; batchStart += concurrency) {
-      if (this._batchCancelled) {
-        this.addBatchLog(`已取消`, 'warning');
-        break;
-      }
-      
-      const batch = freeAccounts.slice(batchStart, batchStart + concurrency);
-      this.addBatchLog(`--- 第 ${Math.floor(batchStart / concurrency) + 1} 批（${batch.length} 个）---`);
-      
-      // 并行执行当前批次
-      const promises = batch.map((acc, i) => {
-        const globalIdx = batchStart + i;
-        return this._processOneAccount(acc, globalIdx, freeAccounts.length);
-      });
-      
-      const results = await Promise.all(promises);
-      
-      // 统计
-      for (const r of results) {
+    const updateProgress = () => {
+      this.updateUsageDisplay();
+      if (progressEl) progressEl.textContent = `${doneCount} / ${freeAccounts.length}  (✓${successCount} ✗${failCount} ⏭${skipCount})`;
+      this.updateStatusView(`批量绑卡 ${doneCount}/${freeAccounts.length}: 成功${successCount} 失败${failCount} 跳过${skipCount}`);
+    };
+    
+    // 滑动窗口并行：完成一个立刻补上下一个
+    let nextIdx = 0;
+    const self = this;
+    
+    const runNext = () => {
+      if (self._batchCancelled || nextIdx >= freeAccounts.length) return null;
+      const idx = nextIdx++;
+      const acc = freeAccounts[idx];
+      return self._processOneAccount(acc, idx, freeAccounts.length).then(async (r) => {
         doneCount++;
         if (r === 'success') successCount++;
         else if (r === 'skip') skipCount++;
         else failCount++;
-        await this.incrementUsage();
-      }
-      
-      this.updateUsageDisplay();
-      if (progressEl) progressEl.textContent = `${doneCount} / ${freeAccounts.length}  (✓${successCount} ✗${failCount} ⏭${skipCount})`;
-      this.updateStatusView(`批量绑卡 ${doneCount}/${freeAccounts.length}: 成功${successCount} 失败${failCount} 跳过${skipCount}`);
+        await self.incrementUsage();
+        updateProgress();
+        return runNext();
+      });
+    };
+    
+    const workers = [];
+    for (let i = 0; i < Math.min(concurrency, freeAccounts.length); i++) {
+      workers.push(runNext());
     }
+    await Promise.all(workers);
     
     // 完成
     const summary = `批量绑卡完成: 成功 ${successCount}, 失败 ${failCount}, 跳过 ${skipCount}`;

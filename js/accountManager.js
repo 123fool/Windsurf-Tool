@@ -536,6 +536,18 @@ const AccountManager = {
         }
       }
       
+      // 勾选"仅未导出过"时，过滤掉已导出的
+      const onlyNew = document.getElementById('exportOnlyNew')?.checked;
+      if (onlyNew) {
+        const before = accounts.length;
+        accounts = accounts.filter(acc => !acc.exportedAt);
+        exportTypeName = `未导出的${exportTypeName}`;
+        if (accounts.length === 0) {
+          showCustomAlert(`没有未导出过的${exportTypeName}账号（共${before}个已导出）`, 'info');
+          return;
+        }
+      }
+      
       const exportData = accounts.map(acc => this.buildExportAccountRecord(acc));
       
       const jsonContent = JSON.stringify(exportData, null, 2);
@@ -555,6 +567,13 @@ const AccountManager = {
       });
       
       if (saveResult.success) {
+        // 标记已导出
+        const now = new Date().toISOString();
+        for (const acc of accounts) {
+          try {
+            await window.ipcRenderer.invoke('update-account', { id: acc.id, exportedAt: now });
+          } catch (e) {}
+        }
         if (typeof showToast === 'function') {
           showToast(`成功导出 ${accounts.length} 个${exportTypeName}账号`, 'success');
         } else {
