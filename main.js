@@ -1334,7 +1334,7 @@ async function checkSingleAccountPlan(account, accounts) {
   if (account.refreshToken) {
     try {
       const refreshResp = await axios.post(
-        'https://securetoken.googleapis.com/v1/token?key=AIzaSyDAEIGELke3xco6FNnKrzVOGBnXhSmiJws',
+        `https://securetoken.googleapis.com/v1/token?key=${CONSTANTS.FIREBASE_API_KEY}`,
         `grant_type=refresh_token&refresh_token=${account.refreshToken}`,
         { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
       );
