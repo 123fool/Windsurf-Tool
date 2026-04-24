@@ -1,0 +1,5 @@
+npx electron-builder --win --x64 --ia32 --arm64 -c.npmRebuild=false 2>&1
+
+
+
+npx electron-builder --mac --x64 --arm64 2>&1

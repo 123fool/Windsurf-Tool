@@ -1,0 +1,23 @@
+# Docker 忽略文件
+node_modules
+npm-debug.log
+dist
+.git
+.gitignore
+README.md
+.env
+.nyc_output
+coverage
+.DS_Store
+*.log
+.github
+.vscode
+*.md
+.editorconfig
+.eslintrc
+.prettierrc
+*.iml
+.idea
+*.swp
+*.swo
+*~
